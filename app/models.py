@@ -23,6 +23,18 @@ RECEIVE_SEQ_DEFAULT = text("nextval('receive_seq_seq')")
 RECEIVE_SEQ_DDL = "CREATE SEQUENCE IF NOT EXISTS receive_seq_seq START WITH 1 CACHE 1"
 RECEIVE_SEQ_HIGH_WATER_SQL = "SELECT last_value, is_called FROM receive_seq_seq"
 
+# Per-chip advisory lock (transaction-scoped) serializing event ingestion
+# with adjudication publishes.  Sequence values are non-transactional: a
+# reading/void INSERT claims its receive_seq at nextval() time but only
+# becomes visible at COMMIT, so without this lock a concurrent publish
+# could read a high-water mark that already covers a still-uncommitted
+# event, and that event would later commit *inside* the published
+# high-water without ever having participated in the adjudication.
+# Taking this lock before the INSERT (and before fixing the high-water
+# mark at publish time) makes lock order == receive_seq order == commit
+# order per chip, so the published boundary is atomic.
+CHIP_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended(:chip_id, 0))"
+
 
 def _uuid() -> str:
     return str(uuid.uuid4())

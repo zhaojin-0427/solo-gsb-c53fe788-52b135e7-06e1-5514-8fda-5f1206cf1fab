@@ -13,6 +13,7 @@ from .adjudication import Reading as ChainReading
 from .adjudication import Segment, adjudicate
 from .db import Base, engine, get_db
 from .models import (
+    CHIP_LOCK_SQL,
     RECEIVE_SEQ_DDL,
     RECEIVE_SEQ_HIGH_WATER_SQL,
     Adjudication,
@@ -118,6 +119,19 @@ def _is_voided(db: Session, reading_id: str) -> bool:
     )
 
 
+def _lock_chip(db: Session, chip_id: str) -> None:
+    """Serialize event ingestion and adjudication publishing per chip.
+
+    The lock is transaction-scoped: an event insert holds it until commit,
+    so once a publisher acquires it, every event of this chip whose
+    receive_seq was already assigned is also committed and visible to the
+    publisher's next statements; any event of this chip committed later
+    necessarily claimed its receive_seq after the publisher read the
+    sequence high-water mark, and therefore lands above it.
+    """
+    db.execute(text(CHIP_LOCK_SQL), {"chip_id": chip_id})
+
+
 # --------------------------------------------------------------------------
 # meta
 # --------------------------------------------------------------------------
@@ -203,6 +217,11 @@ def create_reading(
     existing = db.get(Reading, payload.id)
     if existing is not None:
         return _reading_echo_or_conflict(db, existing, payload, response)
+    # Hold the per-chip lock across the INSERT (which claims the receive
+    # sequence number) until commit, so a concurrent publish of this chip
+    # either sees this reading committed or fixes its high-water mark
+    # below this reading's receive_seq.
+    _lock_chip(db, payload.chip_id)
     reading = Reading(
         id=payload.id, chip_id=payload.chip_id, point=payload.point, time=payload.time
     )
@@ -258,6 +277,9 @@ def create_void(
     if existing is not None:
         response.status_code = 200
         return void_out(existing)
+    # Same per-chip boundary discipline as readings: lock before the
+    # INSERT claims its receive_seq, hold until commit.
+    _lock_chip(db, reading.chip_id)
     void = VoidEvent(reading_id=payload.reading_id, reason=payload.reason)
     db.add(void)
     try:
@@ -319,10 +341,17 @@ def publish_adjudication(
             },
         )
 
-    # Atomically fix the receive-sequence high-water mark: every reading and
-    # void event with receive_seq <= high is (and forever will be) the exact
-    # input set of this version.  Later events get higher sequence numbers
-    # and can only affect future versions.
+    # Atomically fix the receive-sequence high-water mark.  Taking the
+    # per-chip advisory lock first makes the boundary consistent: every
+    # reading/void event of this chip with receive_seq <= high was
+    # committed before this point (its transaction held this lock until
+    # commit), so it is visible to the queries below and joins this
+    # version's input set; every event of this chip committed afterwards
+    # claims its receive_seq only after we read the sequence, so it lands
+    # above high and can only affect future versions.  The track snapshot,
+    # the high-water mark and the adjudication inputs therefore describe
+    # one and the same atomic boundary.
+    _lock_chip(db, chip_id)
     row = db.execute(text(RECEIVE_SEQ_HIGH_WATER_SQL)).one()
     high = int(row[0]) if row[1] else 0
 

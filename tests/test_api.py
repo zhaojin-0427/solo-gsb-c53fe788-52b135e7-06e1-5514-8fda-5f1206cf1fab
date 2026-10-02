@@ -255,3 +255,248 @@ def test_publish_unknown_track_404(client):
 def test_get_missing_adjudication_404(client, track_id):
     resp = client.get(f"/tracks/{track_id}/chips/CHIP-001/adjudications/99")
     assert resp.status_code == 404
+
+
+# ----------------------------------------------------------- concurrency --
+#
+# Regression tests for the receive-seq high-water race: an event that has
+# claimed its receive_seq but not yet committed must never be covered by a
+# published high-water mark it did not participate in.
+
+def test_publish_boundary_waits_for_inflight_reading(client, track_id):
+    import threading
+    import time
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text
+
+    from app.db import SessionLocal
+    from app.main import publish_adjudication
+    from app.models import CHIP_LOCK_SQL, Reading
+    from app.schemas import AdjudicationCreate
+
+    chip = "CHIP-INFLIGHT"
+    # Simulate an in-flight POST /readings: per-chip lock held, row
+    # inserted (receive_seq claimed), transaction still open.
+    s1 = SessionLocal()
+    s1.execute(text(CHIP_LOCK_SQL), {"chip_id": chip})
+    s1.add(
+        Reading(
+            id="rd-inflight",
+            chip_id=chip,
+            point="CP1",
+            time=datetime(2026, 10, 1, 8, 10, tzinfo=timezone.utc),
+        )
+    )
+    s1.flush()
+    seq = s1.execute(
+        text("SELECT receive_seq FROM readings WHERE id = 'rd-inflight'")
+    ).scalar_one()
+
+    published = {}
+
+    def do_publish():
+        s2 = SessionLocal()
+        try:
+            published["body"] = publish_adjudication(
+                track_id, chip, AdjudicationCreate(expected_version=0), s2
+            )
+        finally:
+            s2.close()
+
+    t = threading.Thread(target=do_publish)
+    t.start()
+    time.sleep(0.5)
+    # The publish must wait for the in-flight reading instead of fixing a
+    # high-water mark that would silently cover it.
+    assert t.is_alive(), "publish must wait for the in-flight reading"
+    s1.commit()
+    t.join(timeout=10)
+    s1.close()
+    assert not t.is_alive(), "publish must complete once the reading commits"
+
+    body = published["body"]
+    assert body["receive_seq_high"] >= seq
+    inputs = (
+        [r["id"] for r in body["adopted_readings"]]
+        + [r["id"] for r in body["excluded_readings"]]
+        + [r["id"] for r in body["voided_readings"]]
+    )
+    assert "rd-inflight" in inputs
+
+
+def test_publish_boundary_waits_for_inflight_void(client, track_id):
+    import threading
+    import time
+
+    from sqlalchemy import text
+
+    from app.db import SessionLocal
+    from app.main import publish_adjudication
+    from app.models import CHIP_LOCK_SQL, VoidEvent
+    from app.schemas import AdjudicationCreate
+
+    chip = "CHIP-INFLIGHT-VOID"
+    client.post("/readings", json=_reading("rd-target", chip=chip, point="CP1"))
+
+    # In-flight POST /voids: lock held, void event inserted, not committed.
+    s1 = SessionLocal()
+    s1.execute(text(CHIP_LOCK_SQL), {"chip_id": chip})
+    s1.add(VoidEvent(reading_id="rd-target", reason="misread"))
+    s1.flush()
+    seq = s1.execute(
+        text("SELECT receive_seq FROM void_events WHERE reading_id = 'rd-target'")
+    ).scalar_one()
+
+    published = {}
+
+    def do_publish():
+        s2 = SessionLocal()
+        try:
+            published["body"] = publish_adjudication(
+                track_id, chip, AdjudicationCreate(expected_version=0), s2
+            )
+        finally:
+            s2.close()
+
+    t = threading.Thread(target=do_publish)
+    t.start()
+    time.sleep(0.5)
+    assert t.is_alive(), "publish must wait for the in-flight void event"
+    s1.commit()
+    t.join(timeout=10)
+    s1.close()
+    assert not t.is_alive()
+
+    body = published["body"]
+    assert body["receive_seq_high"] >= seq
+    assert [r["id"] for r in body["voided_readings"]] == ["rd-target"]
+    assert "rd-target" not in [r["id"] for r in body["adopted_readings"]]
+
+
+def test_event_after_boundary_lands_above_high_water(client, track_id):
+    chip = "CHIP-BOUNDARY"
+    client.post("/readings", json=_reading("rd-a", chip=chip, point="CP1"))
+    resp = client.post(
+        f"/tracks/{track_id}/chips/{chip}/adjudications",
+        json={"expected_version": 0},
+    )
+    assert resp.status_code == 201
+    high = resp.json()["receive_seq_high"]
+
+    # Committed after the boundary: must receive a seq above the published
+    # high-water mark and stay out of v1.
+    late = client.post(
+        "/readings",
+        json=_reading("rd-late", chip=chip, point="CP1", time="2026-10-01T08:11:00Z"),
+    )
+    assert late.status_code == 201
+    assert late.json()["receive_seq"] > high
+
+    v1 = client.get(f"/tracks/{track_id}/chips/{chip}/adjudications/1").json()
+    assert v1["receive_seq_high"] == high
+    ids_v1 = [
+        r["id"]
+        for r in v1["adopted_readings"] + v1["excluded_readings"] + v1["voided_readings"]
+    ]
+    assert "rd-late" not in ids_v1
+
+    resp = client.post(
+        f"/tracks/{track_id}/chips/{chip}/adjudications",
+        json={"expected_version": 1},
+    )
+    assert resp.status_code == 201
+    v2 = resp.json()
+    assert v2["receive_seq_high"] >= late.json()["receive_seq"]
+    ids_v2 = [
+        r["id"]
+        for r in v2["adopted_readings"] + v2["excluded_readings"] + v2["voided_readings"]
+    ]
+    assert "rd-late" in ids_v2
+
+
+def test_concurrent_ingest_and_publish_keep_atomic_boundary(client, track_id):
+    """Hammer one chip with concurrent uploads, voids and publishes; every
+    published version must satisfy: committed events with receive_seq <=
+    receive_seq_high are exactly the version's input set."""
+    import threading
+
+    chip = "CHIP-RACE"
+    errors = []
+    voids = []  # (reading_id, receive_seq) of committed void events
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def uploader(n):
+        try:
+            for i in range(12):
+                rid = f"race-{n}-{i}"
+                r = client.post(
+                    "/readings",
+                    json=_reading(rid, chip=chip, point="CP1"),
+                )
+                assert r.status_code == 201, r.text
+                if i % 4 == 3:
+                    v = client.post(
+                        "/voids", json={"reading_id": rid, "reason": "misread"}
+                    )
+                    assert v.status_code == 201, v.text
+                    with lock:
+                        voids.append((rid, v.json()["receive_seq"]))
+        except Exception as exc:  # noqa: BLE001 - surfaced below
+            with lock:
+                errors.append(exc)
+
+    def publisher():
+        expected = 0
+        try:
+            while not stop.is_set():
+                r = client.post(
+                    f"/tracks/{track_id}/chips/{chip}/adjudications",
+                    json={"expected_version": expected},
+                )
+                if r.status_code == 201:
+                    expected += 1
+                elif r.status_code == 409:
+                    expected = r.json()["current_version"]
+                else:
+                    raise AssertionError(
+                        f"unexpected publish status {r.status_code}: {r.text}"
+                    )
+        except Exception as exc:  # noqa: BLE001 - surfaced below
+            with lock:
+                errors.append(exc)
+
+    workers = [threading.Thread(target=uploader, args=(n,)) for n in range(3)]
+    pub = threading.Thread(target=publisher)
+    pub.start()
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    stop.set()
+    pub.join(timeout=30)
+    assert not pub.is_alive()
+    assert not errors
+
+    readings = client.get(f"/chips/{chip}/readings").json()
+    versions = client.get(f"/tracks/{track_id}/chips/{chip}/adjudications").json()
+    assert len(versions) >= 2, "the race should have produced several versions"
+    for v in versions:
+        high = v["receive_seq_high"]
+        included = (
+            {r["id"] for r in v["adopted_readings"]}
+            | {r["id"] for r in v["excluded_readings"]}
+            | {r["id"] for r in v["voided_readings"]}
+        )
+        voided_ids = {r["id"] for r in v["voided_readings"]}
+        for e in readings:
+            if e["receive_seq"] <= high:
+                assert e["id"] in included, (v["version"], e["id"])
+            else:
+                assert e["id"] not in included, (v["version"], e["id"])
+        for rid, vseq in voids:
+            if vseq <= high:
+                assert rid in voided_ids, (v["version"], rid)
+            else:
+                assert rid not in voided_ids, (v["version"], rid)
