@@ -1,3 +1,4 @@
+import hashlib
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -119,6 +120,51 @@ def _is_voided(db: Session, reading_id: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# per-chip event/publish serialization
+# --------------------------------------------------------------------------
+
+# Events (readings, voids) get their receive_seq from a non-transactional
+# PostgreSQL sequence: nextval claims a value even if the inserting
+# transaction is still open.  Without serialization an adjudication publish
+# could read the sequence high-water mark past an in-flight event that is not
+# yet visible, publishing a version whose high water covers an event that was
+# not part of its input set -- and if that event commits afterwards, its
+# receive_seq is trapped below an already-published high water.
+#
+# Every mutation of a chip's event stream therefore takes a
+# transaction-scoped advisory lock keyed by the chip id *before* its row (and
+# its sequence value) is created, and every publish takes the same lock
+# before reading the high-water mark.  PostgreSQL releases xact advisory
+# locks at commit/rollback, so the critical section always covers both the
+# sequence claim and the commit:
+#
+#   * event committed before the publish boundary: lock held first, the row
+#     is visible inside the publish transaction and its seq <= high;
+#   * event not yet committed at the boundary: the publish blocks until it
+#     commits (visible, included) or aborts (its seq is a gap, never used);
+#   * any event that starts afterwards gets a higher seq and can only enter
+#     a later version.
+#
+# Different chips use different keys, so unrelated chips stay concurrent.
+def chip_lock_key(chip_id: str) -> int:
+    # Map the 64-bit unsigned digest into the signed BIGINT range that
+    # pg_advisory_xact_lock(bigint) accepts.
+    value = int.from_bytes(hashlib.sha256(chip_id.encode("utf-8")).digest()[:8], "big")
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def lock_chip_events(db: Session, chip_id: str) -> None:
+    # CAST(... AS BIGINT): psycopg2 binds large Python ints as NUMERIC, and
+    # PostgreSQL will not implicitly coerce that to the bigint overload of
+    # pg_advisory_xact_lock.  (Plain ":k::bigint" confuses SQLAlchemy's bind
+    # parameter lexer.)
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:k AS BIGINT))"),
+        {"k": chip_lock_key(chip_id)},
+    )
+
+
+# --------------------------------------------------------------------------
 # meta
 # --------------------------------------------------------------------------
 
@@ -203,6 +249,9 @@ def create_reading(
     existing = db.get(Reading, payload.id)
     if existing is not None:
         return _reading_echo_or_conflict(db, existing, payload, response)
+    # Serialize against concurrent publishes of this chip across the whole
+    # insert + commit (the lock is released at commit/rollback).
+    lock_chip_events(db, payload.chip_id)
     reading = Reading(
         id=payload.id, chip_id=payload.chip_id, point=payload.point, time=payload.time
     )
@@ -258,6 +307,9 @@ def create_void(
     if existing is not None:
         response.status_code = 200
         return void_out(existing)
+    # The void is an event on the parent reading's chip: serialize against
+    # concurrent adjudication publishes of that chip.
+    lock_chip_events(db, reading.chip_id)
     void = VoidEvent(reading_id=payload.reading_id, reason=payload.reason)
     db.add(void)
     try:
@@ -319,10 +371,17 @@ def publish_adjudication(
             },
         )
 
-    # Atomically fix the receive-sequence high-water mark: every reading and
-    # void event with receive_seq <= high is (and forever will be) the exact
-    # input set of this version.  Later events get higher sequence numbers
-    # and can only affect future versions.
+    # Atomic boundary for this version: take the same per-chip lock that
+    # every reading/void insert for this chip holds until its commit.  From
+    # here until this transaction commits no new event for the chip can be
+    # inserted in another transaction, and any in-flight insert has either
+    # committed (visible below) or rolled back (its seq stays unused).
+    lock_chip_events(db, chip_id)
+
+    # Fix the receive-sequence high-water mark inside the boundary: every
+    # reading and void event with receive_seq <= high is (and forever will be)
+    # the exact input set of this version.  Later events get higher sequence
+    # numbers and can only affect future versions.
     row = db.execute(text(RECEIVE_SEQ_HIGH_WATER_SQL)).one()
     high = int(row[0]) if row[1] else 0
 
